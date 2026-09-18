@@ -43,6 +43,20 @@ _FIXED_EVENT_FIELDS = {
     "tool.completed": lambda tool, preview, kw: {
         "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False)},
     "reasoning.available": lambda tool, preview, kw: {"text": preview or ""}}
+# Tool results ride ``tool.completed`` as a bounded preview; the full result stays in the transcript.
+_TOOL_COMPLETED_PREVIEW_MAX_CHARS = 500
+
+
+def _tool_completed_preview(result: Any, redact_sensitive_text: Callable[..., str]) -> str:
+    """Bounded, secret-redacted result summary for the public run stream — redacted BEFORE
+    truncation so a cut never leaves a secret's prefix on the wire."""
+    if result is None:
+        return ""
+    text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+    preview = redact_sensitive_text(text, force=True)
+    if len(preview) > _TOOL_COMPLETED_PREVIEW_MAX_CHARS:
+        preview = preview[:_TOOL_COMPLETED_PREVIEW_MAX_CHARS] + "…"
+    return preview
 
 
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
@@ -161,7 +175,11 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
         # lifecycle boundaries must land so clients can observe delegate_task failures.
         fields = _FIXED_EVENT_FIELDS.get(event_type)
         if fields is not None:
-            _push(_run_event(run_id, event_type, **fields(tool_name, preview, kwargs)))
+            event_fields = fields(tool_name, preview, kwargs)
+            if event_type == "tool.completed":
+                # What the tool returned, so a client can show the result and not just the timing.
+                event_fields["preview"] = _tool_completed_preview(kwargs.get("result"), redact_sensitive_text)
+            _push(_run_event(run_id, event_type, **event_fields))
         elif event_type in {"subagent.start", "subagent.complete"}:
             event = _run_event(run_id, event_type)
             if preview is not None:
@@ -175,6 +193,53 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
             _push(event)
 
     return _callback
+
+
+def _attach_live_stream_callbacks(self, run_id: str, agent, loop: "asyncio.AbstractEventLoop", *, _api_server) -> None:
+    """Give a run the live signals a messaging turn gets (``_wire_turn_agent_callbacks``), as SSE events.
+
+    Without these a client sees nothing between tool calls: reasoning only surfaces as
+    ``reasoning.available``, a truncated copy of the reply sent after the model call ends, and
+    lifecycle lines (compaction, retries, context warnings) are printed to the gateway log only.
+
+    - ``reasoning.delta`` ``{text}`` — reasoning tokens as the provider streams them.
+    - ``status`` ``{kind, text}`` — the agent's lifecycle and warning lines.
+    - ``notice`` ``{text, level, key}`` — structured out-of-band notices (credits, quotas).
+    """
+    redact_sensitive_text = _api_server.redact_sensitive_text
+
+    def _emit(name: str, **fields: Any) -> None:
+        if run_id not in self._run_streams:
+            return
+        with suppress(Exception):
+            loop.call_soon_threadsafe(_put_run_event, self, run_id, _run_event(run_id, name, **fields))
+
+    def _reasoning(text: Optional[str]) -> None:
+        # Deltas are streamed unredacted, exactly like ``message.delta``: a secret split across
+        # two chunks could not be matched anyway, and redacting one half would corrupt the text.
+        if text:
+            _emit("reasoning.delta", text=text)
+
+    def _status(kind: str, message: str) -> None:
+        if message:
+            _emit("status", kind=str(kind or "lifecycle"), text=redact_sensitive_text(str(message), force=True))
+
+    def _notice(notice: Any) -> None:
+        text = getattr(notice, "text", None) if not isinstance(notice, str) else notice
+        if text:
+            _emit("notice", text=redact_sensitive_text(str(text), force=True),
+                  level=getattr(notice, "level", "info"), key=getattr(notice, "key", None))
+
+    agent.reasoning_callback = _reasoning
+    agent.status_callback = _status
+    agent.notice_callback = _notice
+
+
+def _put_run_event(self, run_id: str, event: Dict[str, Any]) -> None:
+    """Loop-side enqueue for a live run; a run whose transport is gone drops the event."""
+    q = self._run_streams.get(run_id)
+    if q is not None:
+        q.put_nowait(event)
 
 
 def _room_permission_for(request: "web.Request") -> str:
@@ -566,6 +631,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 **run.agent_kwargs)
+        _attach_live_stream_callbacks(self, run_id, agent, loop, _api_server=_api_server)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage = await loop.run_in_executor(
